@@ -65,8 +65,191 @@ function defineVectorFields() {
       const nz = Math.sin(y * s) * Math.cos(z * s) + Math.cos(x * s);
       const mag = 0.4 + 0.6 * (Math.sin(x * 0.03) * Math.cos(z * 0.03) + 1) / 2;
       return v(nx, ny, nz).normalize().multiplyScalar(mag);
+    },
+
+    // Chaotic / complex flows (plan: complex vector field equations)
+    'ABC flow': (x, y, z) => {
+      const A = 0.5, B = 0.5, C = 0.5;
+      const vx = A * Math.sin(z) + C * Math.cos(y);
+      const vy = B * Math.sin(x) + A * Math.cos(z);
+      const vz = C * Math.sin(y) + B * Math.cos(x);
+      return v(vx, vy, vz);
+    },
+    'Lorenz (attractor)': (x, y, z) => {
+      const sigma = 10, rho = 28, beta = 8 / 3;
+      const vx = sigma * (y - x);
+      const vy = x * (rho - z) - y;
+      const vz = x * y - beta * z;
+      const vec = v(vx, vy, vz);
+      const mag = vec.length();
+      if (mag > 50) vec.multiplyScalar(50 / mag);
+      return vec;
+    },
+    'Rössler': (x, y, z) => {
+      const a = 0.2, b = 0.2, c = 5.7;
+      const vx = -y - z;
+      const vy = x + a * y;
+      const vz = b + z * (x - c);
+      const vec = v(vx, vy, vz);
+      const mag = vec.length();
+      if (mag > 30) vec.multiplyScalar(30 / mag);
+      return vec;
+    },
+    'Thomas attractor': (x, y, z) => {
+      const b = 0.208186;
+      const vx = Math.sin(y) - b * x;
+      const vy = Math.sin(z) - b * y;
+      const vz = Math.sin(x) - b * z;
+      const vec = v(vx, vy, vz);
+      const mag = vec.length();
+      if (mag > 2) vec.multiplyScalar(2 / mag);
+      return vec;
+    },
+    'Double gyre (XY)': (x, y, z) => {
+      const xp = (x / 100 + 1);
+      const yp = (y / 100 + 1) * 0.5;
+      const u = Math.PI * Math.sin(2 * Math.PI * xp) * Math.cos(Math.PI * yp);
+      const vv = -2 * Math.PI * Math.cos(2 * Math.PI * xp) * Math.sin(Math.PI * yp);
+      const w = 0.3 * Math.sin(x * 0.02) * Math.cos(z * 0.02);
+      return v(u * 8, vv * 8, w);
+    },
+    'Noise (multi-scale)': (x, y, z) => {
+      const f1 = 0.05, f2 = 0.1, f3 = 0.2;
+      const nx = Math.sin(x * f1) * Math.cos(y * f2) + Math.sin(z * f3) * 0.7 +
+        Math.sin(x * f3 + 1) * Math.cos(z * f1) * 0.5;
+      const ny = Math.cos(x * f2) * Math.sin(z * f1) + Math.cos(y * f3) * 0.7 +
+        Math.sin(y * f1 + 2) * Math.cos(x * f3) * 0.5;
+      const nz = Math.sin(y * f3) * Math.cos(z * f2) + Math.cos(x * f1) * 0.7 +
+        Math.sin(z * f2 + 3) * Math.cos(y * f1) * 0.5;
+      return v(nx, ny, nz).normalize();
+    },
+    'Vortex lattice': (x, y, z) => {
+      const eps = 80;
+      const vortices = [
+        [-60, 0, -60], [60, 0, -60], [-60, 0, 60], [60, 0, 60],
+        [0, 0, -60], [0, 0, 60], [-60, 0, 0], [60, 0, 0]
+      ];
+      const strengths = [1, -1, 1, -1, -1, 1, -1, 1];
+      let vx = 0, vz = 0;
+      for (let i = 0; i < vortices.length; i++) {
+        const [vx0, , vz0] = vortices[i];
+        const dx = x - vx0, dz = z - vz0;
+        const r2 = dx * dx + dz * dz + eps * eps;
+        const k = (strengths[i] * 120) / r2;
+        vx += -dz * k;
+        vz += dx * k;
+      }
+      return v(vx, 0.2 * Math.sin(x * 0.03) * Math.cos(z * 0.03), vz);
     }
   };
+}
+
+/** Trail update interval (seconds) to avoid expensive per-frame line updates. */
+const TRAIL_UPDATE_INTERVAL = 0.1;
+const MAX_TRAIL_POINTS = 500;
+
+/**
+ * Single particle: intro animation, then field-driven motion with a trail line.
+ */
+class Particle {
+  constructor(position, color) {
+    this.position = position.clone();
+    this.color = color.clone();
+    this.introT = 0;
+    this.line = null;
+    this.linePointCount = 0;
+    this.lineUpdateAccumulator = 0;
+    this.linePositions = new Float32Array(MAX_TRAIL_POINTS * 3);
+  }
+
+  /**
+   * Create the trail line when intro completes. Uses current position as first point (need 2 points to draw).
+   */
+  createLine(scene) {
+    const p = this.position;
+    this.linePositions[0] = p.x;
+    this.linePositions[1] = p.y;
+    this.linePositions[2] = p.z;
+    this.linePositions[3] = p.x;
+    this.linePositions[4] = p.y;
+    this.linePositions[5] = p.z;
+    this.linePointCount = 2;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(this.linePositions, 3));
+    geometry.setDrawRange(0, 2);
+    const material = new THREE.LineBasicMaterial({
+      color: this.color.getStyle(),
+      linewidth: 1
+    });
+    this.line = new THREE.Line(geometry, material);
+    scene.add(this.line);
+  }
+
+  /**
+   * Append current position to the trail at a reasonable interval.
+   */
+  maybeAddTrailPoint() {
+    if (!this.line || this.linePointCount >= MAX_TRAIL_POINTS) return;
+    const p = this.position;
+    const i = this.linePointCount * 3;
+    this.linePositions[i] = p.x;
+    this.linePositions[i + 1] = p.y;
+    this.linePositions[i + 2] = p.z;
+    this.linePointCount++;
+    if (this.linePointCount >= 2) {
+      this.line.geometry.setDrawRange(0, this.linePointCount);
+      this.line.geometry.attributes.position.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Detach from particle; trail line is left in the scene as a persistent path.
+   * Returns the line (or null) so the app can track it for cleanup on reset.
+   */
+  dispose() {
+    const line = this.line;
+    this.line = null;
+    return line;
+  }
+
+  /**
+   * Update particle for one frame. Returns true if particle should be removed (exited field).
+   * ctx: { introDuration, start, endFace, scale, fieldSpeed, field, isInsideField, getRandomPositionInFieldWorld, scene }
+   */
+  update(delta, ctx) {
+    const { introDuration, start, endFace, scale, fieldSpeed, field, isInsideField, getRandomPositionInFieldWorld, scene } = ctx;
+
+    if (this.introT < 1) {
+      this.introT = Math.min(1, this.introT + delta / introDuration);
+      this.position.lerpVectors(start, endFace, this.introT);
+      if (this.introT >= 1) {
+        this.position.copy(getRandomPositionInFieldWorld());
+        this.createLine(scene);
+        this.lineUpdateAccumulator = 0;
+      }
+      return false;
+    }
+
+    const lx = this.position.x / scale;
+    const ly = this.position.y / scale;
+    const lz = this.position.z / scale;
+    const vec = field(lx, ly, lz);
+    this.position.x += vec.x * delta * fieldSpeed * scale;
+    this.position.y += vec.y * delta * fieldSpeed * scale;
+    this.position.z += vec.z * delta * fieldSpeed * scale;
+    const nx = this.position.x / scale;
+    const ny = this.position.y / scale;
+    const nz = this.position.z / scale;
+
+    if (!isInsideField(nx, ny, nz)) return true;
+
+    this.lineUpdateAccumulator += delta;
+    if (this.lineUpdateAccumulator >= TRAIL_UPDATE_INTERVAL) {
+      this.lineUpdateAccumulator = 0;
+      this.maybeAddTrailPoint();
+    }
+    return false;
+  }
 }
 
 class App {
@@ -89,6 +272,8 @@ class App {
     this.clock = new THREE.Clock();
     this.frameCount = 0;
     this.lastFpsUpdate = 0;
+    this.particles = [];
+    this.leftBehindTrails = [];
 
     this.init();
     this.setupLighting();
@@ -318,11 +503,33 @@ class App {
   }
 
   /**
-   * Center of the left face of the field cube in world space (intro animation end).
+   * Center of the left face of the field cube in world space.
    */
   getParticleLeftFaceCenterWorld() {
     const scale = this.params.objectScale;
     return new THREE.Vector3(-App.FIELD_HALF * scale, 0, 0);
+  }
+
+  /**
+   * Returns a random color (full saturation).
+   */
+  getRandomBrightColor() {
+    const color = new THREE.Color();
+    color.setHSL(Math.random(), 1, 0.5);
+    return color;
+  }
+
+  /**
+   * Random position inside the field (cube) in world space.
+   * Used when intro completes so particles start field motion away from the origin (avoids zero-magnitude at origin).
+   */
+  getRandomPositionInFieldWorld() {
+    const h = App.FIELD_HALF;
+    const scale = this.params.objectScale;
+    const lx = -h + Math.random() * (2 * h);
+    const ly = -h + Math.random() * (2 * h);
+    const lz = -h + Math.random() * (2 * h);
+    return new THREE.Vector3(lx * scale, ly * scale, lz * scale);
   }
 
   static get MAX_PARTICLES() {
@@ -343,21 +550,36 @@ class App {
       this.particleStartPoint.material.dispose();
       this.particleStartPoint = null;
     }
+    this.leftBehindTrails.forEach((line) => {
+      this.scene.remove(line);
+      line.geometry.dispose();
+      line.material.dispose();
+    });
+    this.leftBehindTrails = [];
+    this.particles.forEach((p) => {
+      const line = p.dispose();
+      if (line) {
+        this.scene.remove(line);
+        line.geometry.dispose();
+        line.material.dispose();
+      }
+    });
+    this.particles = [];
     const n = App.MAX_PARTICLES;
     const positions = new Float32Array(n * 3);
+    const colors = new Float32Array(n * 3);
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
     geometry.setDrawRange(0, 0);
     const material = new THREE.PointsMaterial({
-      color: 0xffcc00,
+      color: 0xffffff,
       size: 12,
-      sizeAttenuation: true
+      sizeAttenuation: true,
+      vertexColors: true
     });
     this.particleStartPoint = new THREE.Points(geometry, material);
     this.scene.add(this.particleStartPoint);
-    this.particleIntroT = new Float32Array(n);
-    for (let i = 0; i < n; i++) this.particleIntroT[i] = -1;
-    this.particleActiveCount = 0;
     this.particleSpawnAccumulator = 0;
   }
 
@@ -365,36 +587,49 @@ class App {
    * Spawn one particle at the start position and begin its intro.
    */
   spawnParticle() {
-    if (this.particleActiveCount >= App.MAX_PARTICLES) return;
-    const i = this.particleActiveCount;
+    if (this.particles.length >= App.MAX_PARTICLES) return;
     const start = this.getParticleStartPositionWorld();
-    const attr = this.particleStartPoint.geometry.attributes.position;
-    attr.array[i * 3] = start.x;
-    attr.array[i * 3 + 1] = start.y;
-    attr.array[i * 3 + 2] = start.z;
-    this.particleIntroT[i] = 0;
-    this.particleActiveCount++;
-    this.particleStartPoint.geometry.setDrawRange(0, this.particleActiveCount);
+    const color = this.getRandomBrightColor();
+    this.particles.push(new Particle(start, color));
   }
 
   /**
-   * Remove particle at index i by swapping with the last active particle.
+   * Remove particle at index i (dispose its trail, swap with last, pop).
    */
   removeParticle(i) {
-    const n = this.particleActiveCount;
+    const n = this.particles.length;
     if (i < 0 || i >= n) return;
-    this.particleActiveCount = n - 1;
-    if (i < this.particleActiveCount) {
-      const attr = this.particleStartPoint.geometry.attributes.position;
-      const posArr = attr.array;
-      const last = this.particleActiveCount;
-      posArr[i * 3] = posArr[last * 3];
-      posArr[i * 3 + 1] = posArr[last * 3 + 1];
-      posArr[i * 3 + 2] = posArr[last * 3 + 2];
-      this.particleIntroT[i] = this.particleIntroT[last];
-      this.particleIntroT[last] = -1;
+    const line = this.particles[i].dispose();
+    if (line) this.leftBehindTrails.push(line);
+    if (i < n - 1) {
+      this.particles[i] = this.particles[n - 1];
     }
-    this.particleStartPoint.geometry.setDrawRange(0, this.particleActiveCount);
+    this.particles.pop();
+  }
+
+  /**
+   * Sync particle positions and colors to the Points geometry buffers.
+   */
+  syncParticlesToBuffers() {
+    const n = this.particles.length;
+    const posAttr = this.particleStartPoint?.geometry?.attributes?.position;
+    const colAttr = this.particleStartPoint?.geometry?.attributes?.color;
+    if (!posAttr || !colAttr) return;
+    const posArr = posAttr.array;
+    const colArr = colAttr.array;
+    for (let i = 0; i < n; i++) {
+      const p = this.particles[i];
+      const j = i * 3;
+      posArr[j] = p.position.x;
+      posArr[j + 1] = p.position.y;
+      posArr[j + 2] = p.position.z;
+      colArr[j] = p.color.r;
+      colArr[j + 1] = p.color.g;
+      colArr[j + 2] = p.color.b;
+    }
+    this.particleStartPoint.geometry.setDrawRange(0, n);
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
   }
 
   /**
@@ -406,79 +641,47 @@ class App {
   }
 
   /**
-   * Intro animation and field motion. Spawns one particle per second; intro then field forces.
-   * Particles that leave the cube are removed.
+   * Update all particles: spawn at 1/sec, run intro/field, remove if exited. Sync to Points mesh.
    */
   updateParticleIntro(delta) {
     if (!this.particleStartPoint?.geometry?.attributes?.position) return;
-    const duration = App.PARTICLE_INTRO_DURATION;
-    const start = this.getParticleStartPositionWorld();
-    const end = this.getParticleLeftFaceCenterWorld();
-    const attr = this.particleStartPoint.geometry.attributes.position;
-    const posArr = attr.array;
-    const scale = this.params.objectScale;
-    const fieldSpeed = this.params.particleFieldSpeed;
-    const field = this.getVectorField();
 
     this.particleSpawnAccumulator += delta;
-    while (this.particleSpawnAccumulator >= 1 && this.particleActiveCount < App.MAX_PARTICLES) {
+    while (this.particleSpawnAccumulator >= 0.5 && this.particles.length < App.MAX_PARTICLES) {
       this.spawnParticle();
-      this.particleSpawnAccumulator -= 1;
+      this.particleSpawnAccumulator -= 0.5;
     }
 
-    for (let i = 0; i < this.particleActiveCount; i++) {
-      let t = this.particleIntroT[i];
-      if (t < 0) continue;
-      if (t < 1) {
-        t = Math.min(1, t + delta / duration);
-        this.particleIntroT[i] = t;
-        const j = i * 3;
-        posArr[j] = start.x + (end.x - start.x) * t;
-        posArr[j + 1] = start.y + (end.y - start.y) * t;
-        posArr[j + 2] = start.z + (end.z - start.z) * t;
-      } else {
-        const j = i * 3;
-        const wx = posArr[j];
-        const wy = posArr[j + 1];
-        const wz = posArr[j + 2];
-        const lx = wx / scale;
-        const ly = wy / scale;
-        const lz = wz / scale;
-        const vec = field(lx, ly, lz);
-        const nx = lx + vec.x * delta * fieldSpeed;
-        const ny = ly + vec.y * delta * fieldSpeed;
-        const nz = lz + vec.z * delta * fieldSpeed;
-        if (!this.isInsideField(nx, ny, nz)) {
-          this.removeParticle(i);
-          i--;
-          continue;
-        }
-        posArr[j] = nx * scale;
-        posArr[j + 1] = ny * scale;
-        posArr[j + 2] = nz * scale;
-      }
+    const ctx = {
+      introDuration: App.PARTICLE_INTRO_DURATION,
+      start: this.getParticleStartPositionWorld(),
+      endFace: this.getParticleLeftFaceCenterWorld(),
+      scale: this.params.objectScale,
+      fieldSpeed: this.params.particleFieldSpeed,
+      field: this.getVectorField(),
+      isInsideField: (lx, ly, lz) => this.isInsideField(lx, ly, lz),
+      getRandomPositionInFieldWorld: () => this.getRandomPositionInFieldWorld(),
+      scene: this.scene
+    };
+
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const remove = this.particles[i].update(delta, ctx);
+      if (remove) this.removeParticle(i);
     }
-    attr.needsUpdate = true;
+
+    this.syncParticlesToBuffers();
   }
 
   /**
    * Sync particle positions with params (e.g. after Grid Scale or Start distance change).
    * Particles still animating are updated by updateParticleIntro; finished ones move to new face center.
    */
+  /**
+   * Sync particle positions when params change. Intro particles use current start/end each frame.
+   * Field particles (t >= 1) are driven by the field and are not moved here.
+   */
   updateParticleStartPosition() {
     if (!this.particleStartPoint?.geometry?.attributes?.position) return;
-    const end = this.getParticleLeftFaceCenterWorld();
-    const attr = this.particleStartPoint.geometry.attributes.position;
-    const posArr = attr.array;
-    for (let i = 0; i < this.particleActiveCount; i++) {
-      if (this.particleIntroT[i] >= 1) {
-        const j = i * 3;
-        posArr[j] = end.x;
-        posArr[j + 1] = end.y;
-        posArr[j + 2] = end.z;
-      }
-    }
-    attr.needsUpdate = true;
   }
 
   /**

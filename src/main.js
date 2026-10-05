@@ -144,111 +144,215 @@ function defineVectorFields() {
   };
 }
 
-/** Trail update interval (seconds) to avoid expensive per-frame line updates. */
-const TRAIL_UPDATE_INTERVAL = 0.1;
-const MAX_TRAIL_POINTS = 500;
+/**
+ * Deterministic seeded RNG (mulberry32). Used for all emission randomness so the
+ * demo is reproducible: same seed => same particle stream. "Structured randomness".
+ */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** How often (seconds) a trail point is appended. */
+const TRAIL_UPDATE_INTERVAL = 0.08;
+/** Hard cap on trail points per particle (buffer size). GUI trailLength <= this. */
+const MAX_TRAIL_POINTS = 240;
+/** Particles older than this are recycled (prevents permanent capture in attractors). */
+const MAX_PARTICLE_AGE = 40;
 
 /**
- * Single particle: intro animation, then field-driven motion with a trail line.
+ * Single wind-tunnel particle.
+ *
+ * Key idea vs. naive scatter: the particle is BORN OUTSIDE the field at the
+ * emitter plane with a horizontal entry velocity. While outside, it flies
+ * ballistically; once inside, its velocity relaxes toward the field vector
+ * (exponential approach controlled by `coupling`). The lag between velocity
+ * and field is what makes the integration visible, and the fading trail
+ * records where it has been.
  */
 class Particle {
-  constructor(position, color) {
+  constructor(position, velocity, color, trailMax) {
     this.position = position.clone();
+    this.velocity = velocity.clone();
     this.color = color.clone();
-    this.introT = 0;
+    this.age = 0;
+    this.trailMax = Math.min(trailMax, MAX_TRAIL_POINTS);
+    this.trailCount = 0;
+    this.trailAccum = 0;
     this.line = null;
-    this.linePointCount = 0;
-    this.lineUpdateAccumulator = 0;
     this.linePositions = new Float32Array(MAX_TRAIL_POINTS * 3);
+    this.lineColors = new Float32Array(MAX_TRAIL_POINTS * 3);
   }
 
-  /**
-   * Create the trail line when intro completes. Uses current position as first point (need 2 points to draw).
-   */
-  createLine(scene) {
-    const p = this.position;
-    this.linePositions[0] = p.x;
-    this.linePositions[1] = p.y;
-    this.linePositions[2] = p.z;
-    this.linePositions[3] = p.x;
-    this.linePositions[4] = p.y;
-    this.linePositions[5] = p.z;
-    this.linePointCount = 2;
+  createLine(scene, visible) {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(this.linePositions, 3));
-    geometry.setDrawRange(0, 2);
+    geometry.setAttribute('color', new THREE.BufferAttribute(this.lineColors, 3));
+    geometry.setDrawRange(0, 0);
     const material = new THREE.LineBasicMaterial({
-      color: this.color.getStyle(),
-      linewidth: 1
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
     });
     this.line = new THREE.Line(geometry, material);
+    this.line.visible = visible;
+    this.line.frustumCulled = false;
+    // Seed with current position (needs 2 points to render, so duplicate).
+    this.pushTrailPoint(true);
+    this.pushTrailPoint(true);
     scene.add(this.line);
   }
 
-  /**
-   * Append current position to the trail at a reasonable interval.
-   */
-  maybeAddTrailPoint() {
-    if (!this.line || this.linePointCount >= MAX_TRAIL_POINTS) return;
+  /** Rewrite the whole trail color gradient: dim tail -> bright head. */
+  refreshTrailColors() {
+    const n = this.trailCount;
+    for (let i = 0; i < n; i++) {
+      const t = n <= 1 ? 1 : i / (n - 1); // 0 = oldest, 1 = newest
+      const f = 0.08 + 0.92 * t * t;
+      const j = i * 3;
+      this.lineColors[j] = this.color.r * f;
+      this.lineColors[j + 1] = this.color.g * f;
+      this.lineColors[j + 2] = this.color.b * f;
+    }
+    if (this.line) this.line.geometry.attributes.color.needsUpdate = true;
+  }
+
+  pushTrailPoint(force = false) {
     const p = this.position;
-    const i = this.linePointCount * 3;
-    this.linePositions[i] = p.x;
-    this.linePositions[i + 1] = p.y;
-    this.linePositions[i + 2] = p.z;
-    this.linePointCount++;
-    if (this.linePointCount >= 2) {
-      this.line.geometry.setDrawRange(0, this.linePointCount);
+    if (!force && this.trailCount >= this.trailMax) {
+      // Sliding window: drop oldest point.
+      this.linePositions.copyWithin(0, 3);
+      const j = (this.trailMax - 1) * 3;
+      this.linePositions[j] = p.x;
+      this.linePositions[j + 1] = p.y;
+      this.linePositions[j + 2] = p.z;
+      this.refreshTrailColors();
+    } else {
+      if (this.trailCount >= MAX_TRAIL_POINTS) return;
+      const j = this.trailCount * 3;
+      this.linePositions[j] = p.x;
+      this.linePositions[j + 1] = p.y;
+      this.linePositions[j + 2] = p.z;
+      this.trailCount++;
+      this.refreshTrailColors();
+    }
+    if (this.line) {
+      this.line.geometry.setDrawRange(0, this.trailCount);
       this.line.geometry.attributes.position.needsUpdate = true;
     }
   }
 
-  /**
-   * Detach from particle; trail line is left in the scene as a persistent path.
-   * Returns the line (or null) so the app can track it for cleanup on reset.
-   */
-  dispose() {
-    const line = this.line;
-    this.line = null;
-    return line;
+  setTrailLength(n) {
+    this.trailMax = Math.min(Math.max(2, Math.round(n)), MAX_TRAIL_POINTS);
+    if (this.trailCount > this.trailMax) {
+      // Keep the newest points.
+      const excess = this.trailCount - this.trailMax;
+      this.linePositions.copyWithin(0, excess * 3, this.trailCount * 3);
+      this.trailCount = this.trailMax;
+      this.refreshTrailColors();
+      if (this.line) {
+        this.line.geometry.setDrawRange(0, this.trailCount);
+        this.line.geometry.attributes.position.needsUpdate = true;
+      }
+    }
+  }
+
+  dispose(scene) {
+    if (this.line) {
+      scene.remove(this.line);
+      this.line.geometry.dispose();
+      this.line.material.dispose();
+      this.line = null;
+    }
   }
 
   /**
-   * Update particle for one frame. Returns true if particle should be removed (exited field).
-   * ctx: { introDuration, start, endFace, scale, fieldSpeed, field, isInsideField, getRandomPositionInFieldWorld, scene }
+   * Advance one frame. Returns 'dead' when the particle left the domain or
+   * expired, otherwise 'alive'.
+   * ctx: { field, scale, fieldSpeed, coupling, cursorForce, half, killMargin, trailInterval }
    */
   update(delta, ctx) {
-    const { introDuration, start, endFace, scale, fieldSpeed, field, isInsideField, getRandomPositionInFieldWorld, scene } = ctx;
-
-    if (this.introT < 1) {
-      this.introT = Math.min(1, this.introT + delta / introDuration);
-      this.position.lerpVectors(start, endFace, this.introT);
-      if (this.introT >= 1) {
-        this.position.copy(getRandomPositionInFieldWorld());
-        this.createLine(scene);
-        this.lineUpdateAccumulator = 0;
-      }
-      return false;
-    }
+    this.age += delta;
+    const { field, scale, fieldSpeed, coupling, cursorForce, half } = ctx;
 
     const lx = this.position.x / scale;
     const ly = this.position.y / scale;
     const lz = this.position.z / scale;
-    const vec = field(lx, ly, lz);
-    this.position.x += vec.x * delta * fieldSpeed * scale;
-    this.position.y += vec.y * delta * fieldSpeed * scale;
-    this.position.z += vec.z * delta * fieldSpeed * scale;
-    const nx = this.position.x / scale;
-    const ny = this.position.y / scale;
-    const nz = this.position.z / scale;
+    const inside =
+      lx >= -half && lx <= half && ly >= -half && ly <= half && lz >= -half && lz <= half;
 
-    if (!isInsideField(nx, ny, nz)) return true;
+    if (inside) {
+      // Relax velocity toward the field vector (visible inertia / lag).
+      const target = field(lx, ly, lz).multiplyScalar(fieldSpeed * scale);
+      // Guard against NaN from normalize-at-origin fields.
+      if (!Number.isFinite(target.x + target.y + target.z)) target.set(0, 0, 0);
+      // Clamp absurd magnitudes from 1/r-style fields so particles stay visible.
+      const maxV = 400 * scale;
+      if (target.length() > maxV) target.setLength(maxV);
+      const alpha = 1 - Math.exp(-coupling * delta);
+      this.velocity.lerp(target, alpha);
 
-    this.lineUpdateAccumulator += delta;
-    if (this.lineUpdateAccumulator >= TRAIL_UPDATE_INTERVAL) {
-      this.lineUpdateAccumulator = 0;
-      this.maybeAddTrailPoint();
+      // Optional interactive cursor force (drag with right mouse button).
+      if (cursorForce && cursorForce.active) {
+        const c = cursorForce.center; // world space
+        const dx = this.position.x - c.x;
+        const dy = this.position.y - c.y;
+        const dz = this.position.z - c.z;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) + 1e-3;
+        const radius = Math.max(1, cursorForce.radius * scale);
+        if (dist < radius * 3) {
+          const fall = Math.exp(-(dist * dist) / (radius * radius));
+          const s = cursorForce.strength * scale * fall * delta;
+          if (cursorForce.mode === 'Attractor') {
+            this.velocity.x -= (dx / dist) * s * 8;
+            this.velocity.y -= (dy / dist) * s * 8;
+            this.velocity.z -= (dz / dist) * s * 8;
+          } else if (cursorForce.mode === 'Repeller') {
+            this.velocity.x += (dx / dist) * s * 8;
+            this.velocity.y += (dy / dist) * s * 8;
+            this.velocity.z += (dz / dist) * s * 8;
+          } else {
+            // Vortex: swirl around Y through the cursor point + slight inward pull.
+            this.velocity.x += (-dz / dist) * s * 10 - (dx / dist) * s * 2;
+            this.velocity.z += (dx / dist) * s * 10 - (dz / dist) * s * 2;
+          }
+        }
+      }
     }
-    return false;
+    // Outside the cube: ballistic flight (emitter -> field entry, or field -> exit).
+
+    this.position.x += this.velocity.x * delta;
+    this.position.y += this.velocity.y * delta;
+    this.position.z += this.velocity.z * delta;
+
+    this.trailAccum += delta;
+    if (this.trailAccum >= TRAIL_UPDATE_INTERVAL) {
+      this.trailAccum = 0;
+      this.pushTrailPoint();
+    }
+
+    // Kill when far outside the extended domain or when too old.
+    const m = ctx.killMargin;
+    const px = this.position.x / scale;
+    const py = this.position.y / scale;
+    const pz = this.position.z / scale;
+    if (
+      this.age > MAX_PARTICLE_AGE ||
+      px > half + m || px < -half - m * 2 ||
+      py > half + m || py < -half - m ||
+      pz > half + m || pz < -half - m
+    ) {
+      return 'dead';
+    }
+    return 'alive';
   }
 }
 
@@ -260,37 +364,83 @@ class App {
       starRadius: 800,
       pointSize: 3,
       gridSize: 12,
-      vectorField: 'Constant +X',
+      vectorField: 'Vortex (speed ∝ 1/r)',
       vectorScale: 8,
-      lineStartColor: '#ff0080',
-      lineEndColor: '#00c0ff',
-      particleStartPosition: 250,
+      lineStartColor: '#3a5a78',
+      lineEndColor: '#7fb3d5',
+
+      // Wind-tunnel emission (the core of the demo format)
+      emissionMode: 'Stream',
+      particleCount: 240,
+      emitRate: 70,
+      entrySpeed: 26,
+      emitterWidth: 130,
+      emitterDepth: 130,
+      emitterGap: 36,
+      velocityJitter: 3.5,
+      coupling: 1.4,
       particleFieldSpeed: 30,
-      reset: () => this.reset()
+
+      // Trails
+      trailLength: 90,
+      showTrails: true,
+      headSize: 11,
+
+      // Burst mode
+      burstInterval: 3.0,
+      burstCount: 90,
+      burstRadius: 42,
+
+      // Probe + cursor force
+      showEmitter: true,
+      cursorForceMode: 'Vortex',
+      cursorForceStrength: 26,
+      cursorForceRadius: 46,
+
+      // Reproducibility
+      seed: 1337,
+
+      reset: () => this.reset(),
+      reseed: () => this.reseed()
     };
 
     this.clock = new THREE.Clock();
     this.frameCount = 0;
     this.lastFpsUpdate = 0;
     this.particles = [];
-    this.leftBehindTrails = [];
+    this.rng = mulberry32(this.params.seed);
+    this.emitAccum = 0;
+    this.burstAccum = 0;
+
+    this.cursorForce = {
+      active: false,
+      center: new THREE.Vector3(0, 0, 0),
+      strength: this.params.cursorForceStrength,
+      radius: this.params.cursorForceRadius,
+      mode: this.params.cursorForceMode
+    };
 
     this.init();
     this.setupLighting();
     this.addStars();
     this.setupGUI();
     this.setupKeyboardControls();
+    this.setupPointerControls();
     this.createGrid();
     this.createBoundaryCube();
-    this.createParticleStartPoint();
+    this.createPickProxy();
+    this.createParticleHeads();
     this.createGradientLine();
+    this.createEmitterViz();
+    this.createCursorViz();
+    this.setMessage(this.describeMode());
     this.animate();
   }
 
   init() {
     // Scene
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color("black");
+    this.scene.background = new THREE.Color('black');
 
     // Camera
     this.camera = new THREE.PerspectiveCamera(
@@ -322,6 +472,12 @@ class App {
     this.controls.dampingFactor = 0.25;
     this.controls.target.set(0, 0, 0);
     this.controls.maxDistance = 10000; // max zoom-out distance from target
+    // Right-drag is reserved for the interactive cursor force (see setupPointerControls).
+    this.controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: -1
+    };
 
     // Handle resize
     window.addEventListener('resize', () => this.onResize());
@@ -395,7 +551,7 @@ class App {
   }
 
   setupGUI() {
-    this.gui = new GUI({ title: '⟨ CONTROLS ⟩' });
+    this.gui = new GUI({ title: '⟨ WIND TUNNEL ⟩' });
 
     const viewFolder = this.gui.addFolder('Viewing');
     viewFolder.add(this.params, 'objectScale', 0.1, 10, 0.1).name('Grid Scale').onChange(() => this.updateGridScale());
@@ -413,14 +569,45 @@ class App {
     fieldFolder.add(this.params, 'vectorScale', 0.5, 32, 0.5).name('Vector scale').onChange(() => this.createGradientLine());
     fieldFolder.open();
 
-    const lineFolder = this.gui.addFolder('Gradient Line');
+    // --- Wind-tunnel emission ---
+    const emitFolder = this.gui.addFolder('Emission (wind tunnel)');
+    emitFolder.add(this.params, 'emissionMode', ['Stream', 'Burst', 'Stream + Burst', 'Probe (click)']).name('Injection mode').onChange(() => this.onEmissionModeChange());
+    emitFolder.add(this.params, 'particleCount', 10, 800, 1).name('Max particles');
+    emitFolder.add(this.params, 'emitRate', 1, 300, 1).name('Emit rate /s');
+    emitFolder.add(this.params, 'entrySpeed', 1, 120, 1).name('Entry speed');
+    emitFolder.add(this.params, 'emitterWidth', 4, 200, 1).name('Nozzle width (Y)').onChange(() => this.createEmitterViz());
+    emitFolder.add(this.params, 'emitterDepth', 4, 200, 1).name('Nozzle depth (Z)').onChange(() => this.createEmitterViz());
+    emitFolder.add(this.params, 'emitterGap', 4, 120, 1).name('Emitter gap').onChange(() => this.createEmitterViz());
+    emitFolder.add(this.params, 'velocityJitter', 0, 20, 0.1).name('Velocity jitter');
+    emitFolder.add(this.params, 'coupling', 0.1, 8, 0.05).name('Field coupling');
+    emitFolder.add(this.params, 'particleFieldSpeed', 1, 200, 1).name('Field speed');
+    emitFolder.add(this.params, 'showEmitter').name('Show emitter').onChange(() => this.updateEmitterVisibility());
+    emitFolder.open();
+
+    const trailFolder = this.gui.addFolder('Particles & Trails');
+    trailFolder.add(this.params, 'trailLength', 2, MAX_TRAIL_POINTS, 1).name('Trail length').onChange(() => this.updateTrailLengths());
+    trailFolder.add(this.params, 'showTrails').name('Show trails').onChange(() => this.updateTrailVisibility());
+    trailFolder.add(this.params, 'headSize', 1, 30, 0.5).name('Head size').onChange(() => this.updateHeadSize());
+    trailFolder.add(this.params, 'burstInterval', 0.5, 10, 0.1).name('Burst every (s)');
+    trailFolder.add(this.params, 'burstCount', 4, 300, 1).name('Burst count');
+    trailFolder.add(this.params, 'burstRadius', 4, 120, 1).name('Burst radius');
+    trailFolder.open();
+
+    const cursorFolder = this.gui.addFolder('Cursor force (right-drag)');
+    cursorFolder.add(this.params, 'cursorForceMode', ['Vortex', 'Attractor', 'Repeller']).name('Force mode').onChange(() => { this.cursorForce.mode = this.params.cursorForceMode; });
+    cursorFolder.add(this.params, 'cursorForceStrength', 1, 100, 1).name('Strength').onChange(() => { this.cursorForce.strength = this.params.cursorForceStrength; });
+    cursorFolder.add(this.params, 'cursorForceRadius', 8, 120, 1).name('Radius').onChange(() => { this.cursorForce.radius = this.params.cursorForceRadius; this.updateCursorViz(); });
+    cursorFolder.open();
+
+    const seedFolder = this.gui.addFolder('Reproducibility');
+    seedFolder.add(this.params, 'seed', 1, 99999, 1).name('Seed').onChange(() => this.reseed());
+    seedFolder.add(this.params, 'reseed').name('🎲 Reseed + clear');
+    seedFolder.open();
+
+    const lineFolder = this.gui.addFolder('Field colors');
     lineFolder.addColor(this.params, 'lineStartColor').name('Start Color').onChange(() => this.updateGradientLineColors());
     lineFolder.addColor(this.params, 'lineEndColor').name('End Color').onChange(() => this.updateGradientLineColors());
     lineFolder.open();
-
-    const particlesFolder = this.gui.addFolder('Particles');
-    particlesFolder.add(this.params, 'particleStartPosition', 1, 200, 1).name('Start distance').onChange(() => this.updateParticleStartPosition());
-    particlesFolder.add(this.params, 'particleFieldSpeed', 1, 200, 1).name('Field speed');
 
     const actionsFolder = this.gui.addFolder('Actions');
     actionsFolder.add(this.params, 'reset').name('🔄 Reset');
@@ -436,8 +623,128 @@ class App {
         this.fieldVisible = !this.fieldVisible;
         if (this.gridPoints) this.gridPoints.visible = this.fieldVisible;
         if (this.gradientLine) this.gradientLine.visible = this.fieldVisible;
+      } else if (key === 't') {
+        this.params.showTrails = !this.params.showTrails;
+        this.updateTrailVisibility();
+        this.gui.controllersRecursive().forEach(c => c.updateDisplay());
+      } else if (key === 'e') {
+        this.params.showEmitter = !this.params.showEmitter;
+        this.updateEmitterVisibility();
+        this.gui.controllersRecursive().forEach(c => c.updateDisplay());
+      } else if (key === 'b') {
+        this.fireBurst();
       }
     });
+  }
+
+  /**
+   * Pointer controls:
+   * - Left click (no drag) in Probe mode: launch a probe particle at the clicked point.
+   * - Right-drag: temporary cursor force (vortex / attractor / repeller) inside the field.
+   * Left-drag orbit is preserved.
+   */
+  setupPointerControls() {
+    const el = this.renderer.domElement;
+    this.raycaster = new THREE.Raycaster();
+    this.pointerNdc = new THREE.Vector2();
+    this.downPos = null;
+    this.downButton = 0;
+    this.forceDragging = false;
+
+    // Right-click drag would open the context menu; suppress it on the canvas.
+    el.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    el.addEventListener('pointerdown', (e) => {
+      this.downPos = { x: e.clientX, y: e.clientY, onCanvas: true };
+      this.downButton = e.button;
+      if (e.button === 2) {
+        // Note: OrbitControls is configured with RIGHT: -1 (no-op), so the
+        // camera is unaffected and controls stay enabled throughout the drag.
+        // There is deliberately no controls.enabled=false here: if the
+        // matching pointerup were ever missed, that would wedge rotation off.
+        this.forceDragging = true;
+        this.moveCursorForce(e);
+        this.cursorForce.active = true;
+        this.updateCursorViz();
+      }
+    });
+
+    el.addEventListener('pointermove', (e) => {
+      if (this.forceDragging) this.moveCursorForce(e);
+    });
+
+    // A single window-level pointerup (releases on- or off-canvas end the
+    // force drag; canvas releases bubble up here exactly once).
+    // pointercancel/blur are also handled: a force drag must never get stuck on.
+    const endForceDrag = () => {
+      if (!this.forceDragging) return;
+      this.forceDragging = false;
+      this.cursorForce.active = false;
+      this.updateCursorViz();
+      this.downPos = null;
+    };
+    window.addEventListener('pointerup', (e) => {
+      if (this.forceDragging && e.button === 2) {
+        endForceDrag();
+      } else if (e.button === 0) {
+        const moved = this.downPos
+          ? Math.hypot(e.clientX - this.downPos.x, e.clientY - this.downPos.y)
+          : 99;
+        // Only treat it as a probe click if the press started on the canvas.
+        if (moved < 6 && this.downPos?.onCanvas && this.params.emissionMode === 'Probe (click)') {
+          this.spawnProbeAtPointer(e);
+        }
+        this.downPos = null;
+      }
+    });
+    window.addEventListener('pointercancel', endForceDrag);
+    window.addEventListener('blur', endForceDrag);
+  }
+
+  setPointerNdc(e) {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointerNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointerNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  moveCursorForce(e) {
+    this.setPointerNdc(e);
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    // Intersect the y=0 plane through the field center; fall back to a camera-facing plane.
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hit = new THREE.Vector3();
+    let ok = this.raycaster.ray.intersectPlane(plane, hit);
+    if (!ok) {
+      const n = new THREE.Vector3();
+      this.camera.getWorldDirection(n);
+      const fallback = new THREE.Plane().setFromNormalAndCoplanarPoint(n, new THREE.Vector3(0, 0, 0));
+      ok = this.raycaster.ray.intersectPlane(fallback, hit);
+    }
+    if (ok) {
+      const scale = this.params.objectScale;
+      const h = App.FIELD_HALF * scale;
+      hit.x = THREE.MathUtils.clamp(hit.x, -h, h);
+      hit.y = THREE.MathUtils.clamp(hit.y, -h, h);
+      hit.z = THREE.MathUtils.clamp(hit.z, -h, h);
+      this.cursorForce.center.copy(hit);
+      this.updateCursorViz();
+    }
+  }
+
+  spawnProbeAtPointer(e) {
+    this.setPointerNdc(e);
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+    const hits = this.raycaster.intersectObject(this.pickProxy, false);
+    let point;
+    if (hits.length > 0) {
+      point = hits[0].point.clone();
+    } else {
+      // Clicked outside the cube: project onto the left face center plane instead.
+      const scale = this.params.objectScale;
+      point = new THREE.Vector3(-App.FIELD_HALF * scale, 0, 0);
+    }
+    this.spawnProbe(point);
+    this.setMessage(`Probe launched at (${point.x.toFixed(0)}, ${point.y.toFixed(0)}, ${point.z.toFixed(0)})`);
   }
 
   /**
@@ -486,86 +793,145 @@ class App {
   }
 
   /**
-   * Particle start position in world space for the intro animation.
-   * Uses the left face of the cube (x = -FIELD_HALF): center of that face, then outward
-   * along the face normal (-1, 0, 0) by particleStartPosition (in field-local units).
-   * Result is converted to world space using objectScale.
+   * World X of the emitter plane (outside the left face of the cube).
    */
-  getParticleStartPositionWorld() {
-    const half = App.FIELD_HALF;
-    const d = this.params.particleStartPosition;
+  getEmitterXWorld() {
     const scale = this.params.objectScale;
-    return new THREE.Vector3(
-      -(half + d) * scale,
-      0,
-      0
-    );
+    return -(App.FIELD_HALF + this.params.emitterGap) * scale;
   }
 
   /**
-   * Center of the left face of the field cube in world space.
+   * Random color (full saturation). Uses the seeded RNG for reproducibility.
    */
-  getParticleLeftFaceCenterWorld() {
-    const scale = this.params.objectScale;
-    return new THREE.Vector3(-App.FIELD_HALF * scale, 0, 0);
-  }
-
-  /**
-   * Returns a random color (full saturation).
-   */
-  getRandomBrightColor() {
+  getSeededBrightColor() {
     const color = new THREE.Color();
-    color.setHSL(Math.random(), 1, 0.5);
+    color.setHSL(this.rng(), 1, 0.55);
     return color;
   }
 
-  /**
-   * Random position inside the field (cube) in world space.
-   * Used when intro completes so particles start field motion away from the origin (avoids zero-magnitude at origin).
-   */
-  getRandomPositionInFieldWorld() {
-    const h = App.FIELD_HALF;
-    const scale = this.params.objectScale;
-    const lx = -h + Math.random() * (2 * h);
-    const ly = -h + Math.random() * (2 * h);
-    const lz = -h + Math.random() * (2 * h);
-    return new THREE.Vector3(lx * scale, ly * scale, lz * scale);
-  }
-
-  static get MAX_PARTICLES() {
-    return 10000;
-  }
-
-  static get PARTICLE_INTRO_DURATION() {
-    return 8;
-  }
-
-  /**
-   * Create the particle system (max 10,000 particles). One particle spawns per second.
-   */
-  createParticleStartPoint() {
-    if (this.particleStartPoint) {
-      this.scene.remove(this.particleStartPoint);
-      this.particleStartPoint.geometry.dispose();
-      this.particleStartPoint.material.dispose();
-      this.particleStartPoint = null;
-    }
-    this.leftBehindTrails.forEach((line) => {
-      this.scene.remove(line);
-      line.geometry.dispose();
-      line.material.dispose();
-    });
-    this.leftBehindTrails = [];
-    this.particles.forEach((p) => {
-      const line = p.dispose();
-      if (line) {
-        this.scene.remove(line);
-        line.geometry.dispose();
-        line.material.dispose();
-      }
-    });
+  /** Clear all live particles and their trails. Keeps heads buffer allocated. */
+  clearParticles() {
+    this.particles.forEach((p) => p.dispose(this.scene));
     this.particles = [];
-    const n = App.MAX_PARTICLES;
+    this.emitAccum = 0;
+    this.burstAccum = 0;
+    this.syncParticlesToBuffers();
+  }
+
+  reseed() {
+    this.rng = mulberry32(Math.round(this.params.seed));
+    this.clearParticles();
+    this.setMessage(`Seed ${Math.round(this.params.seed)} — stream restarted deterministically`);
+  }
+
+  onEmissionModeChange() {
+    this.clearParticles();
+    this.setMessage(this.describeMode());
+  }
+
+  describeMode() {
+    switch (this.params.emissionMode) {
+      case 'Stream':
+        return 'Stream mode — particles enter from the left nozzle and the field bends them';
+      case 'Burst':
+        return 'Burst mode — press B or wait for a ring release, watch the field deform it';
+      case 'Stream + Burst':
+        return 'Stream + Burst — continuous flow with periodic ring bursts';
+      default:
+        return 'Probe mode — click anywhere inside the cube to launch a particle';
+    }
+  }
+
+  setMessage(text) {
+    const el = document.getElementById('message');
+    if (el) {
+      el.textContent = text;
+      el.classList.add('visible');
+    }
+  }
+
+  /**
+   * Spawn one stream particle at the emitter plane with a horizontal entry
+   * velocity. Y/Z are drawn from the seeded RNG across the nozzle aperture,
+   * and emission times are staggered by the emit-rate scheduler — so neighbors
+   * trace different trajectories instead of all doing the same thing.
+   */
+  spawnStreamParticle() {
+    if (this.particles.length >= this.params.particleCount) return;
+    const scale = this.params.objectScale;
+    const y = (this.rng() - 0.5) * this.params.emitterWidth * scale;
+    const z = (this.rng() - 0.5) * this.params.emitterDepth * scale;
+    const pos = new THREE.Vector3(this.getEmitterXWorld(), y, z);
+    const j = this.params.velocityJitter * scale;
+    const vel = new THREE.Vector3(
+      this.params.entrySpeed * scale,
+      (this.rng() - 0.5) * 2 * j,
+      (this.rng() - 0.5) * 2 * j
+    );
+    const p = new Particle(pos, vel, this.getSeededBrightColor(), this.params.trailLength);
+    p.createLine(this.scene, this.params.showTrails);
+    this.particles.push(p);
+  }
+
+  /**
+   * Burst mode: release a ring of particles around the field center and watch
+   * the field deform it. Great for vortices, attractors, shear.
+   */
+  fireBurst() {
+    const scale = this.params.objectScale;
+    const n = Math.min(
+      Math.round(this.params.burstCount),
+      Math.max(0, this.params.particleCount - this.particles.length)
+    );
+    if (n <= 0) return;
+    const radius = this.params.burstRadius * scale;
+    const baseAngle = this.rng() * Math.PI * 2;
+    for (let i = 0; i < n; i++) {
+      const a = baseAngle + (i / n) * Math.PI * 2;
+      const wobble = (this.rng() - 0.5) * 6 * scale;
+      const pos = new THREE.Vector3(
+        Math.cos(a) * radius,
+        wobble,
+        Math.sin(a) * radius
+      );
+      // Gentle tangential + outward push so the ring starts coherent, then deforms.
+      const vel = new THREE.Vector3(
+        -Math.sin(a) * 6 * scale + Math.cos(a) * 3 * scale,
+        (this.rng() - 0.5) * 2 * scale,
+        Math.cos(a) * 6 * scale + Math.sin(a) * 3 * scale
+      );
+      const p = new Particle(pos, vel, this.getSeededBrightColor(), this.params.trailLength);
+      p.createLine(this.scene, this.params.showTrails);
+      this.particles.push(p);
+    }
+  }
+
+  /** Probe mode: launch one particle from the clicked point, initially at rest. */
+  spawnProbe(point) {
+    if (this.particles.length >= Math.max(this.params.particleCount, 1)) {
+      // Make room: recycle the oldest particle.
+      const oldest = this.particles.shift();
+      if (oldest) oldest.dispose(this.scene);
+    }
+    const startVel = new THREE.Vector3(this.params.entrySpeed * this.params.objectScale * 0.25, 0, 0);
+    const p = new Particle(point, startVel, this.getSeededBrightColor(), this.params.trailLength);
+    p.createLine(this.scene, this.params.showTrails);
+    this.particles.push(p);
+  }
+
+  /**
+   * Create the particle head Points cloud (bright heads; trails are per-particle Lines).
+   */
+  createParticleHeads() {
+    if (this.particleHeads) {
+      this.scene.remove(this.particleHeads);
+      this.particleHeads.geometry.dispose();
+      this.particleHeads.material.dispose();
+      this.particleHeads = null;
+    }
+    this.particles.forEach((p) => p.dispose(this.scene));
+    this.particles = [];
+    const n = 800; // buffer capacity; active count governed by params.particleCount
     const positions = new Float32Array(n * 3);
     const colors = new Float32Array(n * 3);
     const geometry = new THREE.BufferGeometry();
@@ -574,33 +940,28 @@ class App {
     geometry.setDrawRange(0, 0);
     const material = new THREE.PointsMaterial({
       color: 0xffffff,
-      size: 12,
+      size: this.params.headSize,
       sizeAttenuation: true,
-      vertexColors: true
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
     });
-    this.particleStartPoint = new THREE.Points(geometry, material);
-    this.scene.add(this.particleStartPoint);
-    this.particleSpawnAccumulator = 0;
+    this.particleHeads = new THREE.Points(geometry, material);
+    this.particleHeads.frustumCulled = false;
+    this.scene.add(this.particleHeads);
+    this.emitAccum = 0;
+    this.burstAccum = 0;
   }
 
   /**
-   * Spawn one particle at the start position and begin its intro.
-   */
-  spawnParticle() {
-    if (this.particles.length >= App.MAX_PARTICLES) return;
-    const start = this.getParticleStartPositionWorld();
-    const color = this.getRandomBrightColor();
-    this.particles.push(new Particle(start, color));
-  }
-
-  /**
-   * Remove particle at index i (dispose its trail, swap with last, pop).
+   * Remove particle at index i (dispose its trail line, swap with last, pop).
    */
   removeParticle(i) {
     const n = this.particles.length;
     if (i < 0 || i >= n) return;
-    const line = this.particles[i].dispose();
-    if (line) this.leftBehindTrails.push(line);
+    this.particles[i].dispose(this.scene);
     if (i < n - 1) {
       this.particles[i] = this.particles[n - 1];
     }
@@ -608,12 +969,12 @@ class App {
   }
 
   /**
-   * Sync particle positions and colors to the Points geometry buffers.
+   * Sync particle head positions and colors to the Points geometry buffers.
    */
   syncParticlesToBuffers() {
     const n = this.particles.length;
-    const posAttr = this.particleStartPoint?.geometry?.attributes?.position;
-    const colAttr = this.particleStartPoint?.geometry?.attributes?.color;
+    const posAttr = this.particleHeads?.geometry?.attributes?.position;
+    const colAttr = this.particleHeads?.geometry?.attributes?.color;
     if (!posAttr || !colAttr) return;
     const posArr = posAttr.array;
     const colArr = colAttr.array;
@@ -627,7 +988,7 @@ class App {
       colArr[j + 1] = p.color.g;
       colArr[j + 2] = p.color.b;
     }
-    this.particleStartPoint.geometry.setDrawRange(0, n);
+    this.particleHeads.geometry.setDrawRange(0, n);
     posAttr.needsUpdate = true;
     colAttr.needsUpdate = true;
   }
@@ -641,47 +1002,66 @@ class App {
   }
 
   /**
-   * Update all particles: spawn at 1/sec, run intro/field, remove if exited. Sync to Points mesh.
+   * Per-frame particle driver: staggered emission per the injection mode,
+   * velocity-relaxation integration, recycle-on-exit, buffer sync.
    */
-  updateParticleIntro(delta) {
-    if (!this.particleStartPoint?.geometry?.attributes?.position) return;
+  updateParticles(delta) {
+    if (!this.particleHeads?.geometry?.attributes?.position) return;
+    const mode = this.params.emissionMode;
 
-    this.particleSpawnAccumulator += delta;
-    while (this.particleSpawnAccumulator >= 0.5 && this.particles.length < App.MAX_PARTICLES) {
-      this.spawnParticle();
-      this.particleSpawnAccumulator -= 0.5;
+    // Trim excess if the user lowered Max particles.
+    while (this.particles.length > this.params.particleCount) {
+      this.removeParticle(this.particles.length - 1);
+    }
+
+    if (mode === 'Stream' || mode === 'Stream + Burst') {
+      this.emitAccum += delta * this.params.emitRate;
+      let guard = 0;
+      while (this.emitAccum >= 1 && this.particles.length < this.params.particleCount && guard < 40) {
+        this.spawnStreamParticle();
+        this.emitAccum -= 1;
+        guard++;
+      }
+      if (this.emitAccum > 8) this.emitAccum = 8; // don't backlog a burst after stalls
+    }
+
+    if (mode === 'Burst' || mode === 'Stream + Burst') {
+      this.burstAccum += delta;
+      if (this.burstAccum >= this.params.burstInterval) {
+        this.burstAccum = 0;
+        this.fireBurst();
+      }
     }
 
     const ctx = {
-      introDuration: App.PARTICLE_INTRO_DURATION,
-      start: this.getParticleStartPositionWorld(),
-      endFace: this.getParticleLeftFaceCenterWorld(),
+      field: this.getVectorField(),
       scale: this.params.objectScale,
       fieldSpeed: this.params.particleFieldSpeed,
-      field: this.getVectorField(),
-      isInsideField: (lx, ly, lz) => this.isInsideField(lx, ly, lz),
-      getRandomPositionInFieldWorld: () => this.getRandomPositionInFieldWorld(),
-      scene: this.scene
+      coupling: this.params.coupling,
+      cursorForce: this.cursorForce,
+      half: App.FIELD_HALF,
+      killMargin: 60
     };
 
     for (let i = this.particles.length - 1; i >= 0; i--) {
-      const remove = this.particles[i].update(delta, ctx);
-      if (remove) this.removeParticle(i);
+      if (this.particles[i].update(delta, ctx) === 'dead') this.removeParticle(i);
     }
 
     this.syncParticlesToBuffers();
   }
 
-  /**
-   * Sync particle positions with params (e.g. after Grid Scale or Start distance change).
-   * Particles still animating are updated by updateParticleIntro; finished ones move to new face center.
-   */
-  /**
-   * Sync particle positions when params change. Intro particles use current start/end each frame.
-   * Field particles (t >= 1) are driven by the field and are not moved here.
-   */
-  updateParticleStartPosition() {
-    if (!this.particleStartPoint?.geometry?.attributes?.position) return;
+  updateTrailLengths() {
+    this.particles.forEach((p) => p.setTrailLength(this.params.trailLength));
+  }
+
+  updateTrailVisibility() {
+    this.particles.forEach((p) => {
+      if (p.line) p.line.visible = this.params.showTrails;
+    });
+  }
+
+  updateHeadSize() {
+    if (this.particleHeads) this.particleHeads.material.size = this.params.headSize;
   }
 
   /**
@@ -710,10 +1090,131 @@ class App {
     this.scene.add(this.boundaryCube);
   }
 
+  /** Invisible box used to raycast probe clicks to an exact 3D point in the field. */
+  createPickProxy() {
+    if (this.pickProxy) {
+      this.scene.remove(this.pickProxy);
+      this.pickProxy.geometry.dispose();
+      this.pickProxy = null;
+    }
+    const size = 200;
+    const geom = new THREE.BoxGeometry(size, size, size);
+    const mat = new THREE.MeshBasicMaterial({ visible: false });
+    this.pickProxy = new THREE.Mesh(geom, mat);
+    this.pickProxy.scale.setScalar(this.params.objectScale);
+    this.scene.add(this.pickProxy);
+  }
+
+  /**
+   * Emitter visualization: a source plane outside the cube + aperture outline
+   * on the left face + streaks showing the +X entry direction. Makes the
+   * "particles enter the field here" idea explicit.
+   */
+  createEmitterViz() {
+    if (this.emitterGroup) {
+      this.scene.remove(this.emitterGroup);
+      this.emitterGroup.traverse((o) => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose?.();
+      });
+      this.emitterGroup = null;
+    }
+    const scale = this.params.objectScale;
+    const half = App.FIELD_HALF * scale;
+    const group = new THREE.Group();
+    const ex = this.getEmitterXWorld();
+    const w = this.params.emitterWidth * scale;
+    const d = this.params.emitterDepth * scale;
+
+    // Source plane (translucent cyan).
+    const planeGeom = new THREE.PlaneGeometry(d, w);
+    const planeMat = new THREE.MeshBasicMaterial({
+      color: 0x00f0ff, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false
+    });
+    const plane = new THREE.Mesh(planeGeom, planeMat);
+    plane.rotation.y = Math.PI / 2;
+    plane.position.set(ex, 0, 0);
+    group.add(plane);
+
+    // Source frame (bright outline).
+    const frameGeom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(ex, -w / 2, -d / 2),
+      new THREE.Vector3(ex, w / 2, -d / 2),
+      new THREE.Vector3(ex, w / 2, d / 2),
+      new THREE.Vector3(ex, -w / 2, d / 2),
+      new THREE.Vector3(ex, -w / 2, -d / 2)
+    ]);
+    group.add(new THREE.Line(frameGeom, new THREE.LineBasicMaterial({ color: 0x00f0ff, transparent: true, opacity: 0.9 })));
+
+    // Aperture outline on the entry (left) face — same size as the nozzle.
+    const faceGeom = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-half, -w / 2, -d / 2),
+      new THREE.Vector3(-half, w / 2, -d / 2),
+      new THREE.Vector3(-half, w / 2, d / 2),
+      new THREE.Vector3(-half, -w / 2, d / 2),
+      new THREE.Vector3(-half, -w / 2, -d / 2)
+    ]);
+    group.add(new THREE.Line(faceGeom, new THREE.LineBasicMaterial({ color: 0xffcc00, transparent: true, opacity: 0.8 })));
+
+    // Entry streaks: emitter plane -> entry face at a few aperture rows.
+    const streakMat = new THREE.LineBasicMaterial({ color: 0x00f0ff, transparent: true, opacity: 0.28 });
+    const rows = [-0.4, -0.2, 0, 0.2, 0.4];
+    rows.forEach((f) => {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ex, f * w, 0),
+        new THREE.Vector3(-half, f * w, 0)
+      ]);
+      group.add(new THREE.Line(g, streakMat));
+    });
+
+    group.visible = this.params.showEmitter;
+    this.emitterGroup = group;
+    this.scene.add(group);
+  }
+
+  updateEmitterVisibility() {
+    if (this.emitterGroup) this.emitterGroup.visible = this.params.showEmitter;
+  }
+
+  /** Ring + dot marking the interactive cursor force while right-dragging. */
+  createCursorViz() {
+    if (this.cursorViz) {
+      this.scene.remove(this.cursorViz);
+      this.cursorViz.traverse((o) => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) o.material.dispose?.();
+      });
+      this.cursorViz = null;
+    }
+    const group = new THREE.Group();
+    const ringGeom = new THREE.TorusGeometry(1, 0.03, 8, 48);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0xffcc00, transparent: true, opacity: 0.9 });
+    const ring = new THREE.Mesh(ringGeom, ringMat);
+    ring.rotation.x = Math.PI / 2;
+    group.add(ring);
+    const dotGeom = new THREE.SphereGeometry(0.06, 12, 12);
+    const dot = new THREE.Mesh(dotGeom, new THREE.MeshBasicMaterial({ color: 0xffcc00 }));
+    group.add(dot);
+    group.visible = false;
+    this.cursorViz = group;
+    this.cursorRing = ring;
+    this.scene.add(group);
+    this.updateCursorViz();
+  }
+
+  updateCursorViz() {
+    if (!this.cursorViz) return;
+    const r = Math.max(1, this.cursorForce.radius * this.params.objectScale);
+    this.cursorViz.position.copy(this.cursorForce.center);
+    if (this.cursorRing) this.cursorRing.scale.setScalar(r);
+    this.cursorViz.visible = this.cursorForce.active;
+  }
+
   /**
    * Create a vector at every grid point. Each segment starts at the grid point and
    * extends in the direction (and magnitude) given by the current vector field formula,
    * scaled by vectorScale. The field is sampled at the specified grid density.
+   * Kept subtle (muted colors) so it reads as layer 1 under the bright particles.
    */
   createGradientLine() {
     if (this.gradientLine) {
@@ -758,11 +1259,14 @@ class App {
       vertexColors: true,
       linewidth: 1,
       worldUnits: false,
+      transparent: true,
+      opacity: 0.55,
       resolution: new THREE.Vector2(window.innerWidth, window.innerHeight)
     });
 
     this.gradientLine = new LineSegments2(geometry, material);
     this.gradientLine.scale.setScalar(this.params.objectScale);
+    this.gradientLine.visible = this.fieldVisible !== false;
     this.scene.add(this.gradientLine);
   }
 
@@ -826,12 +1330,15 @@ class App {
     const material = new THREE.PointsMaterial({
       size: this.params.pointSize,
       vertexColors: true,
-      sizeAttenuation: true
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.5
     });
 
     this.gridPoints = new THREE.Points(geometry, material);
     this.gridPoints.userData.baseScale = 1;
     this.gridPoints.scale.setScalar(this.params.objectScale);
+    this.gridPoints.visible = this.fieldVisible !== false;
     this.scene.add(this.gridPoints);
     this.frameGridInView();
   }
@@ -857,7 +1364,11 @@ class App {
     if (this.boundaryCube) {
       this.boundaryCube.scale.setScalar(this.params.objectScale);
     }
-    this.updateParticleStartPosition();
+    if (this.pickProxy) {
+      this.pickProxy.scale.setScalar(this.params.objectScale);
+    }
+    this.createEmitterViz();
+    this.updateCursorViz();
   }
 
   /**
@@ -885,19 +1396,47 @@ class App {
     this.params.objectScale = 4;
     this.params.gridSize = 12;
     this.params.pointSize = 3;
-    this.params.vectorField = 'Constant +X';
+    this.params.vectorField = 'Vortex (speed ∝ 1/r)';
     this.params.vectorScale = 8;
-    this.params.lineStartColor = '#ff0080';
-    this.params.lineEndColor = '#00c0ff';
-    this.params.particleStartPosition = 250;
+    this.params.lineStartColor = '#3a5a78';
+    this.params.lineEndColor = '#7fb3d5';
+    this.params.emissionMode = 'Stream';
+    this.params.particleCount = 240;
+    this.params.emitRate = 70;
+    this.params.entrySpeed = 26;
+    this.params.emitterWidth = 130;
+    this.params.emitterDepth = 130;
+    this.params.emitterGap = 36;
+    this.params.velocityJitter = 3.5;
+    this.params.coupling = 1.4;
     this.params.particleFieldSpeed = 30;
+    this.params.trailLength = 90;
+    this.params.showTrails = true;
+    this.params.headSize = 11;
+    this.params.burstInterval = 3.0;
+    this.params.burstCount = 90;
+    this.params.burstRadius = 42;
+    this.params.showEmitter = true;
+    this.params.cursorForceMode = 'Vortex';
+    this.params.cursorForceStrength = 26;
+    this.params.cursorForceRadius = 46;
+    this.params.seed = 1337;
+    this.cursorForce.mode = 'Vortex';
+    this.cursorForce.strength = 26;
+    this.cursorForce.radius = 46;
+    this.cursorForce.active = false;
+    this.rng = mulberry32(1337);
     this.createGrid();
     this.createBoundaryCube();
-    this.createParticleStartPoint();
+    this.createPickProxy();
+    this.createParticleHeads();
     this.createGradientLine();
+    this.createEmitterViz();
+    this.updateCursorViz();
     if (this.gridPoints) this.gridPoints.visible = this.fieldVisible;
     if (this.gradientLine) this.gradientLine.visible = this.fieldVisible;
     this.gui.controllersRecursive().forEach(c => c.updateDisplay());
+    this.setMessage(this.describeMode());
   }
 
   updateCamera() {
@@ -930,14 +1469,13 @@ class App {
       this.updateFPS(time);
     });
 
-    const delta = this.clock.getDelta();
-    this.updateParticleIntro(delta);
+    const delta = Math.min(this.clock.getDelta(), 0.05);
+    this.updateParticles(delta);
     this.updateCamera();
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
 }
 
-// Start the application
-new App();
-
+// Start the application (exposed for console debugging / automated smoke tests)
+window.flowApp = new App();
